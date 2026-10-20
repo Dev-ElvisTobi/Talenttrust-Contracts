@@ -50,6 +50,7 @@ fn full_happy_path() {
         &s.freelancer,
         &s.token.address,
         &vec![&s.env, 100i128, 200i128],
+        false,
     );
     assert_eq!(id, 1);
     s.escrow.deposit_funds(&id, &300);
@@ -73,6 +74,7 @@ fn rejects_overfunding_and_double_release() {
         &s.freelancer,
         &s.token.address,
         &vec![&s.env, 100i128],
+        false,
     );
     assert_eq!(
         s.escrow.try_deposit_funds(&id, &101),
@@ -91,6 +93,7 @@ fn dispute_split_and_cancel() {
         &s.freelancer,
         &s.token.address,
         &vec![&s.env, 400i128],
+        false,
     );
     s.escrow.deposit_funds(&id, &400);
     s.escrow.open_dispute(&id, &s.freelancer);
@@ -103,6 +106,7 @@ fn dispute_split_and_cancel() {
         &s.freelancer,
         &s.token.address,
         &vec![&s.env, 50i128],
+        false,
     );
     s.escrow.deposit_funds(&id2, &50);
     s.escrow.cancel_contract(&id2);
@@ -122,8 +126,71 @@ fn pause_blocks_mutations() {
             &s.client,
             &s.freelancer,
             &s.token.address,
-            &vec![&s.env, 1i128]
+            &vec![&s.env, 1i128],
+            false
         ),
         Err(Ok(EscrowError::Paused))
     );
+}
+
+#[test]
+fn sequential_milestones_enforced() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128, 200i128, 300i128],
+        true,
+    );
+    s.escrow.deposit_funds(&id, &600);
+    
+    // Cannot release milestone 2 before milestone 1
+    assert_eq!(
+        s.escrow.try_release_milestone(&id, &2),
+        Err(Ok(EscrowError::MilestoneOutOfOrder))
+    );
+    
+    // Cannot release milestone 1 before milestone 0
+    assert_eq!(
+        s.escrow.try_release_milestone(&id, &1),
+        Err(Ok(EscrowError::MilestoneOutOfOrder))
+    );
+    
+    // Can release milestone 0
+    s.escrow.release_milestone(&id, &0);
+    
+    // Can now release milestone 1
+    s.escrow.release_milestone(&id, &1);
+    
+    // Cannot release milestone 0 again
+    assert_eq!(
+        s.escrow.try_release_milestone(&id, &0),
+        Err(Ok(EscrowError::MilestoneAlreadyReleased))
+    );
+    
+    // Can now release milestone 2
+    s.escrow.release_milestone(&id, &2);
+    
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+}
+
+#[test]
+fn non_sequential_milestones_allows_any_order() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128, 200i128, 300i128],
+        false,
+    );
+    s.escrow.deposit_funds(&id, &600);
+    
+    // Can release milestone 2 first when sequential_milestones is false
+    s.escrow.release_milestone(&id, &2);
+    s.escrow.release_milestone(&id, &0);
+    s.escrow.release_milestone(&id, &1);
+    
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
 }

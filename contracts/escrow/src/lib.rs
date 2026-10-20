@@ -39,6 +39,7 @@ pub enum EscrowError {
     InvalidSplit = 14,
     InvalidRating = 15,
     ReputationAlreadyIssued = 16,
+    MilestoneOutOfOrder = 17,
 }
 
 #[contracttype]
@@ -72,6 +73,7 @@ pub struct EscrowContract {
     pub released_amount: i128,
     pub status: ContractStatus,
     pub reputation_issued: bool,
+    pub sequential_milestones: bool,
 }
 
 #[contracttype]
@@ -192,6 +194,7 @@ impl Escrow {
         freelancer: Address,
         token: Address,
         milestone_amounts: Vec<i128>,
+        sequential_milestones: bool,
     ) -> Result<u64, EscrowError> {
         admin(&env)?;
         require_not_paused(&env)?;
@@ -229,6 +232,7 @@ impl Escrow {
             released_amount: 0,
             status: ContractStatus::Created,
             reputation_issued: false,
+            sequential_milestones,
         };
         save(&env, &c);
         env.events()
@@ -287,6 +291,19 @@ impl Escrow {
         }
         if c.funded_amount - c.released_amount < m.amount {
             return Err(EscrowError::InsufficientFunds);
+        }
+        if c.sequential_milestones {
+            let mut expected_index: u32 = 0;
+            for (i, milestone) in c.milestones.iter().enumerate() {
+                if milestone.released {
+                    expected_index = (i + 1) as u32;
+                } else {
+                    break;
+                }
+            }
+            if index != expected_index {
+                return Err(EscrowError::MilestoneOutOfOrder);
+            }
         }
         transfer(
             &env,
