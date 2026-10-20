@@ -18,7 +18,7 @@ pub const MAX_MILESTONES: u32 = 20;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280; // ~1 day
 const PERSISTENT_TTL_EXTEND: u32 = 518_400; // ~30 days
-const DUST_THRESHOLD: i128 = 1000; // Minimum released amount to count toward reputation
+const DUST_THRESHOLD: i128 = 1000; // Minimum released amount to count toward reputation (prevents sybil attacks with micro-escrows)
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
