@@ -18,6 +18,7 @@ pub const MAX_MILESTONES: u32 = 20;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280; // ~1 day
 const PERSISTENT_TTL_EXTEND: u32 = 518_400; // ~30 days
+const DUST_THRESHOLD: i128 = 1000; // Minimum released amount to count toward reputation
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -81,6 +82,8 @@ pub struct EscrowContract {
 pub struct Reputation {
     pub completed_contracts: u32,
     pub total_rating: u32,
+    pub total_weighted_rating: i128,
+    pub total_released_value: i128,
 }
 
 #[contracttype]
@@ -391,6 +394,8 @@ impl Escrow {
     }
 
     /// After completion the client may rate the freelancer (1..=5) once per contract.
+    /// Reputation is weighted by the amount actually released to the freelancer.
+    /// Contracts with released amount below DUST_THRESHOLD are ignored for reputation.
     pub fn issue_reputation(env: Env, id: u64, rating: u32) -> Result<(), EscrowError> {
         let mut c = load(&env, id)?;
         c.client.require_auth();
@@ -405,8 +410,19 @@ impl Escrow {
         }
         let key = DataKey::Reputation(c.freelancer.clone());
         let mut rep: Reputation = env.storage().persistent().get(&key).unwrap_or_default();
-        rep.completed_contracts += 1;
-        rep.total_rating += rating;
+        
+        // Only count reputation if released amount exceeds dust threshold
+        if c.released_amount >= DUST_THRESHOLD {
+            rep.completed_contracts += 1;
+            rep.total_rating += rating;
+            // Weight the rating by the actual value released
+            let weighted_rating = rating as i128 * c.released_amount;
+            rep.total_weighted_rating = rep.total_weighted_rating.checked_add(weighted_rating)
+                .ok_or(EscrowError::InvalidAmount)?;
+            rep.total_released_value = rep.total_released_value.checked_add(c.released_amount)
+                .ok_or(EscrowError::InvalidAmount)?;
+        }
+        
         env.storage().persistent().set(&key, &rep);
         env.storage()
             .persistent()
@@ -435,6 +451,22 @@ impl Escrow {
             .persistent()
             .get(&DataKey::Reputation(freelancer))
             .unwrap_or_default()
+    }
+
+    /// Returns the weighted average rating scaled by 10,000 for precision.
+    /// Returns None if the freelancer has no completed contracts above dust threshold.
+    /// Formula: (total_weighted_rating * 10_000) / total_released_value
+    pub fn get_weighted_average_rating(env: Env, freelancer: Address) -> Option<i128> {
+        let rep = env
+            .storage()
+            .persistent()
+            .get::<_, Reputation>(&DataKey::Reputation(freelancer));
+        match rep {
+            Some(r) if r.total_released_value > 0 => {
+                Some((r.total_weighted_rating * BPS_DENOMINATOR) / r.total_released_value)
+            }
+            _ => None,
+        }
     }
 }
 
