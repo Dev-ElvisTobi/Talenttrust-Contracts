@@ -9,6 +9,7 @@
 //! 6. The client can `cancel_contract` before completion to recover unreleased funds.
 //! 7. After completion the client may `issue_reputation` for the freelancer.
 //! 8. The client may `pay_bonus` directly to the freelancer (tip/bonus).
+//! 9. After completion or resolution the freelancer may `rate_client` to rate the client.
 #![no_std]
 
 use soroban_sdk::{
@@ -179,6 +180,8 @@ enum DataKey {
     ClosedAt(u64),
     Receipt(u64),
     Team(u64),
+    ClientReputation(Address),
+    ClientRated(u64),
 }
 
 #[contract]
@@ -1089,6 +1092,50 @@ impl Escrow {
         Ok(())
     }
 
+    /// After completion or resolution the freelancer may rate the client (1..=5) once per contract.
+    pub fn rate_client(env: Env, id: u64, rating: u32) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.freelancer.require_auth();
+        if !matches!(c.status, ContractStatus::Completed | ContractStatus::Resolved) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let rated_key = DataKey::ClientRated(id);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&rated_key)
+            .unwrap_or(false)
+        {
+            return Err(EscrowError::ReputationAlreadyIssued);
+        }
+        if !(1..=5).contains(&rating) {
+            return Err(EscrowError::InvalidRating);
+        }
+        let rep_key = DataKey::ClientReputation(c.client.clone());
+        let mut rep: Reputation = env.storage().persistent().get(&rep_key).unwrap_or_default();
+        rep.completed_contracts = rep
+            .completed_contracts
+            .checked_add(1)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        rep.total_rating = rep
+            .total_rating
+            .checked_add(rating)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&rep_key, &rep);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rep_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.storage().persistent().set(&rated_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rated_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("rep_cli"), id), (c.client, rating));
+        Ok(())
+    }
+
     /// Governance can void fraudulent ratings, reversing their effect and recording an audit trail.
     pub fn void_rating(env: Env, id: u64, reason: Symbol) -> Result<(), EscrowError> {
         require_admin(&env)?;
@@ -1240,6 +1287,13 @@ impl Escrow {
         env.storage()
             .persistent()
             .get(&DataKey::Reputation(freelancer))
+            .unwrap_or_default()
+    }
+
+    pub fn get_client_reputation(env: Env, client: Address) -> Reputation {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClientReputation(client))
             .unwrap_or_default()
     }
 
