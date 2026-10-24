@@ -123,6 +123,7 @@ enum DataKey {
     Bonus(u64),
     BonusTotal(Address),
     Liability(Address),
+    Payout(u64),
 }
 
 #[contract]
@@ -223,6 +224,19 @@ fn assert_solvent(env: &Env, token: &Address) {
         balance,
         liability
     );
+}
+
+/// Returns the address that should receive freelancer payouts for `c`.
+///
+/// If the freelancer has set a dedicated payout address via
+/// [`Escrow::set_payout_address`] it is returned; otherwise payouts go to the
+/// freelancer's own address (`c.freelancer`). Reputation always accrues to
+/// `c.freelancer` regardless of the payout address.
+fn payee(env: &Env, c: &EscrowContract) -> Address {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Payout(c.id))
+        .unwrap_or_else(|| c.freelancer.clone())
 }
 
 pub fn transition(c: &mut EscrowContract, to: ContractStatus) -> Result<(), EscrowError> {
@@ -339,6 +353,42 @@ impl Escrow {
         Ok(surplus)
     }
 
+    /// Freelancer sets a separate payout address for this escrow. Subsequent
+    /// `release_milestone`, `resolve_dispute` and `pay_bonus` payouts go to
+    /// `payout` instead of the freelancer's own address. Reputation still
+    /// accrues to the freelancer.
+    ///
+    /// Only callable while the escrow is `Created` or `Funded`; rejected with
+    /// `InvalidStatus` while a dispute is open. `payout` must not be the
+    /// contract address or the client (`InvalidParties`).
+    pub fn set_payout_address(env: Env, id: u64, payout: Address) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        c.freelancer.require_auth();
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if payout == env.current_contract_address() || payout == c.client {
+            return Err(EscrowError::InvalidParties);
+        }
+        let old = payee(&env, &c);
+        let key = DataKey::Payout(id);
+        env.storage().persistent().set(&key, &payout);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events()
+            .publish((symbol_short!("payout"), id), (old, payout));
+        Ok(())
+    }
+
+    /// Returns the payout address for `id`, falling back to the freelancer
+    /// when no dedicated payout address has been set.
+    pub fn get_payout_address(env: Env, id: u64) -> Result<Address, EscrowError> {
+        let c = load(&env, id)?;
+        Ok(payee(&env, &c))
+    }
+
     /// Creates a new escrow agreement. Returns the escrow id.
     pub fn create_contract(
         env: Env,
@@ -449,7 +499,7 @@ impl Escrow {
             &env,
             &c.token,
             &env.current_contract_address(),
-            &c.freelancer,
+            &payee(&env, &c),
             m.amount,
         );
         m.released = true;
@@ -484,7 +534,7 @@ impl Escrow {
         }
 
         // Direct client -> freelancer transfer; escrow balance is untouched.
-        transfer(&env, &c.token, &c.client, &c.freelancer, amount);
+        transfer(&env, &c.token, &c.client, &payee(&env, &c), amount);
 
         // Cumulative per-escrow bonus.
         let bonus_key = DataKey::Bonus(id);
@@ -591,7 +641,7 @@ impl Escrow {
         let to_freelancer = held * freelancer_bps as i128 / BPS_DENOMINATOR;
         let to_client = held - to_freelancer;
         let this = env.current_contract_address();
-        transfer(&env, &c.token, &this, &c.freelancer, to_freelancer);
+        transfer(&env, &c.token, &this, &payee(&env, &c), to_freelancer);
         transfer(&env, &c.token, &this, &c.client, to_client);
         c.released_amount += to_freelancer;
         c.funded_amount = c.released_amount;
