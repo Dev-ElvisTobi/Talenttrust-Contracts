@@ -39,9 +39,11 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `void_rating(id, reason)` | admin | Void a fraudulent rating, reverse reputation and emit audit trail |
 | `sweep_surplus(token, to) -> i128` | admin | Sweep untracked token surplus above aggregate escrow liabilities (`NoSurplus` (`21`) if none) |
 | `freeze_escrow(id, reason)` / `unfreeze_escrow(id)` / `is_frozen(id)` | admin / admin / - | Freeze a single escrow: party mutations return `EscrowFrozen` (`22`); `resolve_dispute` still works |
+| `compact_escrow(id)` | anyone | Replace a terminal escrow with a compact `EscrowReceipt` (emits `("compact", id)`). `Cancelled` any time; `Completed`/`Resolved` only after the rating or `THIRTY_DAYS_IN_LEDGERS` after closing, otherwise `NotCompactable` (`25`) |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
 | `get_contract(id)`, `get_rating(id)`, `contract_count()`, `get_reputation(addr)`, `get_outcomes(addr)`, `get_admin()`, `version()` | - | Reads |
 | `get_bonus(id)`, `get_bonus_total(freelancer)` | - | Reads for cumulative bonus amounts |
+| `get_receipt(id) -> Option<EscrowReceipt>` | - | Receipt of a compacted escrow; `get_contract` on a compacted id returns `EscrowCompacted` (`26`) |
 | `get_payout_address(id)` | - | Payout address for an escrow (falls back to the freelancer) |
 | `get_liability(token)` | - | Aggregate amount held for live escrows in `token` |
 
@@ -103,6 +105,8 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 22 | `EscrowFrozen` | party mutations on a frozen escrow; `freeze_escrow` twice |
 | 23 | `AdminCannotBeParty` | `create_contract` — client or freelancer is the admin address |
 | 24 | `MilestoneTooSmall` | `create_contract` — milestone amount < `MIN_MILESTONE_AMOUNT` (1 000 000) |
+| 25 | `NotCompactable` | `compact_escrow` — escrow live, already compacted, or unrated within the grace period |
+| 26 | `EscrowCompacted` | `get_contract` / `issue_reputation` on a compacted escrow |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 
