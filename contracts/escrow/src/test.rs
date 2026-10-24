@@ -1846,3 +1846,165 @@ fn compact_resolved_unrated_escrow_after_30_days() {
     );
     assert_eq!(s.escrow.get_receipt(&id).unwrap().closed_at, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Team payout splits
+// ---------------------------------------------------------------------------
+
+#[test]
+fn team_split_pays_three_way_with_lead_remainder() {
+    let s = setup();
+    let teammate_a = Address::generate(&s.env);
+    let teammate_b = Address::generate(&s.env);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 1_000_001i128],
+    );
+    let payees = vec![
+        &s.env,
+        (s.freelancer.clone(), 5_000u32),
+        (teammate_a.clone(), 3_000u32),
+        (teammate_b.clone(), 2_000u32),
+    ];
+    s.escrow.set_team_split(&id, &payees);
+    assert_eq!(s.escrow.get_team_split(&id), payees);
+
+    s.escrow.deposit_funds(&id, &1_000_001);
+    s.escrow.release_milestone(&id, &0);
+
+    // 1_000_001 floors to 500_000 / 300_000 / 200_000; the lead gets the 1-unit remainder.
+    assert_eq!(s.token.balance(&s.freelancer), 500_001);
+    assert_eq!(s.token.balance(&teammate_a), 300_000);
+    assert_eq!(s.token.balance(&teammate_b), 200_000);
+    assert_eq!(
+        s.token.balance(&s.freelancer)
+            + s.token.balance(&teammate_a)
+            + s.token.balance(&teammate_b),
+        1_000_001
+    );
+    assert_eq!(s.token.balance(&s.client), 1_000 * U - 1_000_001);
+}
+
+#[test]
+fn rejects_invalid_team_splits() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    let other = Address::generate(&s.env);
+
+    let bad_sum = vec![
+        &s.env,
+        (s.freelancer.clone(), 5_000u32),
+        (other.clone(), 4_000u32),
+    ];
+    assert_eq!(
+        s.escrow.try_set_team_split(&id, &bad_sum),
+        Err(Ok(EscrowError::InvalidSplitConfig))
+    );
+
+    let zero_share = vec![&s.env, (s.freelancer.clone(), 0u32)];
+    assert_eq!(
+        s.escrow.try_set_team_split(&id, &zero_share),
+        Err(Ok(EscrowError::InvalidSplitConfig))
+    );
+
+    let duplicate = vec![
+        &s.env,
+        (s.freelancer.clone(), 5_000u32),
+        (s.freelancer.clone(), 5_000u32),
+    ];
+    assert_eq!(
+        s.escrow.try_set_team_split(&id, &duplicate),
+        Err(Ok(EscrowError::InvalidSplitConfig))
+    );
+
+    let six_payees = vec![
+        &s.env,
+        (Address::generate(&s.env), 1_666u32),
+        (Address::generate(&s.env), 1_666u32),
+        (Address::generate(&s.env), 1_666u32),
+        (Address::generate(&s.env), 1_666u32),
+        (Address::generate(&s.env), 1_666u32),
+        (Address::generate(&s.env), 1_670u32),
+    ];
+    assert_eq!(
+        s.escrow.try_set_team_split(&id, &six_payees),
+        Err(Ok(EscrowError::InvalidSplitConfig))
+    );
+
+    let includes_client = vec![
+        &s.env,
+        (s.freelancer.clone(), 5_000u32),
+        (s.client.clone(), 5_000u32),
+    ];
+    assert_eq!(
+        s.escrow.try_set_team_split(&id, &includes_client),
+        Err(Ok(EscrowError::InvalidSplitConfig))
+    );
+
+    let valid = vec![&s.env, (s.freelancer.clone(), 10_000u32)];
+    s.escrow.set_team_split(&id, &valid);
+    // A partial deposit keeps the status at Created, but splits are frozen once
+    // any funds are in escrow.
+    s.escrow.deposit_funds(&id, &(40 * U));
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Created);
+    assert_eq!(
+        s.escrow.try_set_team_split(&id, &valid),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
+#[test]
+fn dispute_freelancer_share_respects_team_split() {
+    let s = setup();
+    let teammate_a = Address::generate(&s.env);
+    let teammate_b = Address::generate(&s.env);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 4_000_004i128],
+    );
+    let payees = vec![
+        &s.env,
+        (s.freelancer.clone(), 5_000u32),
+        (teammate_a.clone(), 3_000u32),
+        (teammate_b.clone(), 2_000u32),
+    ];
+    s.escrow.set_team_split(&id, &payees);
+    s.escrow.deposit_funds(&id, &4_000_004);
+    s.escrow.open_dispute(&id, &s.freelancer);
+    s.escrow.resolve_dispute(&id, &2_500);
+
+    // 25% of 4_000_004 is 1_000_001; the split floors to 500_000/300_000/200_000
+    // and the lead gets the 1-unit remainder.
+    assert_eq!(s.token.balance(&s.freelancer), 500_001);
+    assert_eq!(s.token.balance(&teammate_a), 300_000);
+    assert_eq!(s.token.balance(&teammate_b), 200_000);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U - 1_000_001);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
+}
+
+
+#[test]
+fn team_split_rejected_on_frozen_escrow() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.freeze_escrow(&id, &symbol_short!("fraud"));
+    let valid = vec![&s.env, (s.freelancer.clone(), 10_000u32)];
+    assert_eq!(
+        s.escrow.try_set_team_split(&id, &valid),
+        Err(Ok(EscrowError::EscrowFrozen))
+    );
+}
