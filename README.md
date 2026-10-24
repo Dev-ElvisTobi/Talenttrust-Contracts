@@ -10,6 +10,8 @@
 Soroban smart contract for the TalentTrust freelancer escrow protocol on Stellar.
 Clients lock payment for a job into escrow, release it milestone by milestone as
 work is approved, and either party can raise a dispute that the protocol admin settles.
+Clients can also pay a tip or bonus that is transferred directly to the freelancer and
+recorded for reputation and analytics.
 
 ## Deployments
 
@@ -28,6 +30,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones |
 | `deposit_funds(id, amount)` | client | Transfer tokens into escrow (status must be `Created`, cannot exceed total) |
 | `release_milestone(id, index)` | client | Pay the freelancer for a milestone |
+| `pay_bonus(id, amount)` | client | Transfer a tip/bonus directly client → freelancer (Funded or Completed escrows) |
 | `open_dispute(id, caller)` | client or freelancer | Freeze the escrow pending resolution (increments `disputes_opened`) |
 | `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance (records dispute win/loss outcomes based on 5,000 bps threshold) |
 | `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held) |
@@ -35,6 +38,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `void_rating(id, reason)` | admin | Void a fraudulent rating, reverse reputation and emit audit trail |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
 | `get_contract(id)`, `get_rating(id)`, `contract_count()`, `get_reputation(addr)`, `get_outcomes(addr)`, `get_admin()`, `version()` | - | Reads |
+| `get_bonus(id)`, `get_bonus_total(freelancer)` | - | Reads for cumulative bonus amounts |
 
 ### Status flow
 
@@ -49,6 +53,16 @@ Status transitions are centrally validated by a guarded state machine:
 Any other status transition returns `EscrowError::InvalidTransition` (`20`). Attempting to `deposit_funds` on an already `Funded` contract returns `EscrowError::InvalidStatus` (`1`) up front.
 
 Resolved jobs allow reputation rating; dispute outcomes and cancellation metrics are tracked in persistent `Outcomes`.
+
+Bonuses are allowed while an escrow is `Funded` or `Completed`; they do not change the escrow status or accounting.
+
+### Events
+
+| Event | Topic | Data |
+| --- | --- | --- |
+| Bonus paid | `("bonus", id)` | `(amount, cumulative)` |
+
+Bonus payments reuse the escrow's existing validation errors: a missing escrow `id`, an escrow in a disallowed state (`Disputed`, `Cancelled`, `Resolved`), a non-positive `amount`, an unauthorized caller (client auth required), and the pause gate all return the corresponding contract error.
 
 ### Reputation Governance & Audit Trail
 - Ratings are recorded per escrow as `RatingRecord { freelancer, rating, issued_at, voided }`.

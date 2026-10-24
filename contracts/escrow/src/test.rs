@@ -691,3 +691,159 @@ fn randomized_lifecycle_property_test() {
         }
     }
 }
+
+#[test]
+fn bonus_on_completed_escrow() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128],
+    );
+    s.escrow.deposit_funds(&id, &100);
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+
+    let contract_before = s.token.balance(&s.escrow.address);
+    s.escrow.pay_bonus(&id, &25);
+    assert_eq!(s.escrow.get_bonus(&id), 25);
+    assert_eq!(s.escrow.get_bonus_total(&s.freelancer), 25);
+    assert_eq!(s.token.balance(&s.freelancer), 125);
+    assert_eq!(s.token.balance(&s.client), 875);
+    assert_eq!(s.token.balance(&s.escrow.address), contract_before);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.funded_amount, 100);
+    assert_eq!(c.released_amount, 100);
+}
+
+#[test]
+fn bonus_on_funded_escrow() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128],
+    );
+    s.escrow.deposit_funds(&id, &100);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+
+    let contract_before = s.token.balance(&s.escrow.address);
+    s.escrow.pay_bonus(&id, &10);
+    assert_eq!(s.escrow.get_bonus(&id), 10);
+    assert_eq!(s.token.balance(&s.freelancer), 10);
+    assert_eq!(s.token.balance(&s.escrow.address), contract_before);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.funded_amount, 100);
+    assert_eq!(c.released_amount, 0);
+}
+
+#[test]
+fn bonus_rejected_on_disputed_and_cancelled() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128],
+    );
+    s.escrow.deposit_funds(&id, &100);
+    s.escrow.open_dispute(&id, &s.freelancer);
+    assert!(s.escrow.try_pay_bonus(&id, &10).is_err());
+
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50i128],
+    );
+    s.escrow.deposit_funds(&id2, &50);
+    s.escrow.cancel_contract(&id2);
+    assert!(s.escrow.try_pay_bonus(&id2, &10).is_err());
+}
+
+#[test]
+fn bonus_rejects_zero_and_negative() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128],
+    );
+    s.escrow.deposit_funds(&id, &100);
+    assert!(s.escrow.try_pay_bonus(&id, &0).is_err());
+    assert!(s.escrow.try_pay_bonus(&id, &-1).is_err());
+    assert_eq!(s.escrow.get_bonus(&id), 0);
+}
+
+#[test]
+fn bonus_requires_client_auth() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128],
+    );
+    s.escrow.deposit_funds(&id, &100);
+    // Only the freelancer authorizes: the client's auth is missing, so it must fail.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.freelancer,
+        invoke: &MockAuthInvoke {
+            contract: &s.escrow.address,
+            fn_name: "pay_bonus",
+            args: (id, 10i128).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.escrow.try_pay_bonus(&id, &10).is_err());
+    assert_eq!(s.escrow.get_bonus(&id), 0);
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+}
+
+#[test]
+fn bonus_cumulative_across_two_escrows() {
+    let s = setup();
+    let id1 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128],
+    );
+    s.escrow.deposit_funds(&id1, &100);
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50i128],
+    );
+    s.escrow.deposit_funds(&id2, &50);
+
+    s.escrow.pay_bonus(&id1, &15);
+    s.escrow.pay_bonus(&id2, &25);
+    assert_eq!(s.escrow.get_bonus(&id1), 15);
+    assert_eq!(s.escrow.get_bonus(&id2), 25);
+    assert_eq!(s.escrow.get_bonus_total(&s.freelancer), 40);
+    assert_eq!(s.token.balance(&s.freelancer), 40);
+}
+
+#[test]
+fn bonus_blocked_when_paused() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100i128],
+    );
+    s.escrow.deposit_funds(&id, &100);
+    s.escrow.set_paused(&true);
+    assert_eq!(
+        s.escrow.try_pay_bonus(&id, &10),
+        Err(Ok(EscrowError::Paused))
+    );
+}

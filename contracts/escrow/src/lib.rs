@@ -8,6 +8,7 @@
 //! 5. Either party may `open_dispute`; the admin settles with `resolve_dispute`.
 //! 6. The client can `cancel_contract` before completion to recover unreleased funds.
 //! 7. After completion the client may `issue_reputation` for the freelancer.
+//! 8. The client may `pay_bonus` directly to the freelancer (tip/bonus).
 #![no_std]
 
 use soroban_sdk::{
@@ -118,6 +119,8 @@ enum DataKey {
     Reputation(Address),
     Outcomes(Address),
     Rating(u64),
+    Bonus(u64),
+    BonusTotal(Address),
 }
 
 #[contract]
@@ -387,6 +390,72 @@ impl Escrow {
         env.events()
             .publish((symbol_short!("release"), id), (index, m.amount));
         Ok(())
+    }
+
+    /// Client pays a bonus/tip directly to the freelancer.
+    ///
+    /// The transfer is made client -> freelancer and never touches the
+    /// contract's held balance, so it cannot affect escrow accounting or a
+    /// dispute split. Allowed on Funded or Completed escrows.
+    pub fn pay_bonus(env: Env, id: u64, amount: i128) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+        let c = load(&env, id)?;
+        c.client.require_auth();
+        if !matches!(c.status, ContractStatus::Funded | ContractStatus::Completed) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        if amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+
+        // Direct client -> freelancer transfer; escrow balance is untouched.
+        transfer(&env, &c.token, &c.client, &c.freelancer, amount);
+
+        // Cumulative per-escrow bonus.
+        let bonus_key = DataKey::Bonus(id);
+        let prev_bonus: i128 = env.storage().persistent().get(&bonus_key).unwrap_or(0);
+        let cumulative = prev_bonus
+            .checked_add(amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&bonus_key, &cumulative);
+        env.storage().persistent().extend_ttl(
+            &bonus_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND,
+        );
+
+        // Cumulative per-freelancer bonus total.
+        let total_key = DataKey::BonusTotal(c.freelancer.clone());
+        let prev_total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        let new_total = prev_total
+            .checked_add(amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&total_key, &new_total);
+        env.storage().persistent().extend_ttl(
+            &total_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND,
+        );
+
+        env.events()
+            .publish((symbol_short!("bonus"), id), (amount, cumulative));
+        Ok(())
+    }
+
+    /// Returns the cumulative bonus paid on a given escrow.
+    pub fn get_bonus(env: Env, id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Bonus(id))
+            .unwrap_or(0)
+    }
+
+    /// Returns the cumulative bonus paid to a freelancer across all escrows.
+    pub fn get_bonus_total(env: Env, freelancer: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BonusTotal(freelancer))
+            .unwrap_or(0)
     }
 
     /// Either party may raise a dispute, freezing releases until the admin resolves it.
