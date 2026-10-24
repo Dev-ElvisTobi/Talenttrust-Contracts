@@ -33,6 +33,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `set_team_split(id, payees)` | freelancer | Configure 1-5 fixed-bps payee shares (sum 10,000) while `Created` and before any deposit (`InvalidSplitConfig` (`27`) otherwise); emits `("team", id) -> len` |
 | `release_milestone(id, index)` | client | Pay the milestone to the team split if set, otherwise the freelancer (or their payout address) |
 | `set_payout_address(id, payout)` | freelancer | Route payouts to a separate address; `Created`/`Funded` only, not during dispute |
+| `release_milestones(id, indices) -> i128` | client | Release several milestones in one call (all-or-nothing, one payout, one save); emits a `release` event per milestone plus `("rel_batch", id) -> (count, total)`; `DuplicateIndex` (`29`) on repeated indices |
 | `pay_bonus(id, amount)` | client | Transfer a tip/bonus directly client → freelancer (Funded or Completed escrows) |
 | `open_dispute(id, caller)` | client or freelancer | Freeze the escrow pending resolution (increments `disputes_opened`) |
 | `resolve_dispute(id, freelancer_bps)` | admin | Split the held balance; the freelancer share follows the team split (records dispute win/loss outcomes based on 5,000 bps threshold) |
@@ -117,7 +118,8 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 25 | `NotCompactable` | `compact_escrow` — escrow live, already compacted, or unrated within the grace period |
 | 26 | `EscrowCompacted` | `get_contract` / `issue_reputation` on a compacted escrow |
 | 27 | `InvalidSplitConfig` | `set_team_split` — bad length, zero/duplicate share, client/contract payee, or sum != 10 000 |
-| 28 | `OutOfOrder` | `release_milestone` on a sequential escrow before all earlier milestones are released |
+| 28 | `OutOfOrder` | `release_milestone` / `release_milestones` on a sequential escrow before all earlier milestones are released |
+| 29 | `DuplicateIndex` | `release_milestones` with a repeated index |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

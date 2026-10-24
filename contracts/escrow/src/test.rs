@@ -2702,3 +2702,156 @@ fn sequential_create_emits_seq_event_and_validates_like_create() {
         Err(Ok(EscrowError::MilestoneTooSmall))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch milestone releases
+// ---------------------------------------------------------------------------
+
+fn three_milestone_escrow(s: &Setup, sequential: bool) -> u64 {
+    let amounts = vec![&s.env, 100 * U, 200 * U, 300 * U];
+    let id = if sequential {
+        s.escrow
+            .create_contract_sequential(&s.client, &s.freelancer, &s.token.address, &amounts)
+    } else {
+        s.escrow
+            .create_contract(&s.client, &s.freelancer, &s.token.address, &amounts)
+    };
+    s.escrow.deposit_funds(&id, &(600 * U));
+    id
+}
+
+#[test]
+fn release_milestones_basic() {
+    let s = setup();
+    let id = three_milestone_escrow(&s, false);
+    let paid = s
+        .escrow
+        .release_milestones(&id, &vec![&s.env, 0u32, 1u32, 2u32]);
+    assert_eq!(paid, 600 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 600 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+}
+
+#[test]
+fn release_milestones_partial_then_single_completes() {
+    let s = setup();
+    let id = three_milestone_escrow(&s, false);
+    s.escrow.release_milestones(&id, &vec![&s.env, 0u32, 1u32]);
+    assert_eq!(s.token.balance(&s.freelancer), 300 * U);
+    assert_eq!(s.escrow.get_contract(&id).released_amount, 300 * U);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+    s.escrow.release_milestone(&id, &2);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    assert_eq!(s.token.balance(&s.freelancer), 600 * U);
+}
+
+#[test]
+fn release_milestones_rejects_empty() {
+    let s = setup();
+    let id = three_milestone_escrow(&s, false);
+    assert_eq!(
+        s.escrow.try_release_milestones(&id, &Vec::new(&s.env)),
+        Err(Ok(EscrowError::InvalidMilestones))
+    );
+}
+
+#[test]
+fn release_milestones_rejects_duplicates() {
+    let s = setup();
+    let id = three_milestone_escrow(&s, false);
+    assert_eq!(
+        s.escrow
+            .try_release_milestones(&id, &vec![&s.env, 0u32, 1u32, 0u32]),
+        Err(Ok(EscrowError::DuplicateIndex))
+    );
+}
+
+#[test]
+fn release_milestones_already_released_fails_without_state_change() {
+    let s = setup();
+    let id = three_milestone_escrow(&s, false);
+    s.escrow.release_milestone(&id, &0);
+    let before = s.escrow.get_contract(&id);
+    let bal_before = s.token.balance(&s.freelancer);
+    assert_eq!(
+        s.escrow.try_release_milestones(&id, &vec![&s.env, 1u32, 0u32]),
+        Err(Ok(EscrowError::MilestoneAlreadyReleased))
+    );
+    assert_eq!(s.escrow.get_contract(&id), before);
+    assert_eq!(s.token.balance(&s.freelancer), bal_before);
+}
+
+#[test]
+fn release_milestones_rejects_insufficient_funds() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U, 300 * U],
+    );
+    s.escrow.deposit_funds(&id, &(400 * U)); // Only fund 400 out of 600
+    assert_eq!(
+        s.escrow
+            .try_release_milestones(&id, &vec![&s.env, 0u32, 1u32, 2u32]),
+        Err(Ok(EscrowError::InsufficientFunds))
+    );
+    // A batch that fits in the held balance succeeds
+    assert_eq!(
+        s.escrow.release_milestones(&id, &vec![&s.env, 0u32, 2u32]),
+        400 * U
+    );
+}
+
+#[test]
+fn release_milestones_matches_single_releases() {
+    let a = setup();
+    let id_a = three_milestone_escrow(&a, false);
+    a.escrow.release_milestone(&id_a, &0);
+    a.escrow.release_milestone(&id_a, &1);
+    a.escrow.release_milestone(&id_a, &2);
+
+    let b = setup();
+    let id_b = three_milestone_escrow(&b, false);
+    b.escrow
+        .release_milestones(&id_b, &vec![&b.env, 0u32, 1u32, 2u32]);
+
+    let ca = a.escrow.get_contract(&id_a);
+    let cb = b.escrow.get_contract(&id_b);
+    assert_eq!(ca.milestones, cb.milestones);
+    assert_eq!(ca.status, cb.status);
+    assert_eq!(ca.funded_amount, cb.funded_amount);
+    assert_eq!(ca.released_amount, cb.released_amount);
+    assert_eq!(
+        a.token.balance(&a.freelancer),
+        b.token.balance(&b.freelancer)
+    );
+    assert_eq!(
+        a.escrow.get_liability(&a.token.address),
+        b.escrow.get_liability(&b.token.address)
+    );
+}
+
+#[test]
+fn release_milestones_sequential_enforced() {
+    let s = setup();
+    let id = three_milestone_escrow(&s, true);
+    assert_eq!(
+        s.escrow.try_release_milestones(&id, &vec![&s.env, 0u32, 2u32]),
+        Err(Ok(EscrowError::OutOfOrder))
+    );
+    // Order within the batch does not matter as long as the prefix is complete
+    s.escrow
+        .release_milestones(&id, &vec![&s.env, 1u32, 0u32]);
+    s.escrow.release_milestones(&id, &vec![&s.env, 2u32]);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+}
+
+#[test]
+fn release_milestones_non_sequential_any_order() {
+    let s = setup();
+    let id = three_milestone_escrow(&s, false);
+    s.escrow
+        .release_milestones(&id, &vec![&s.env, 2u32, 0u32, 1u32]);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+}

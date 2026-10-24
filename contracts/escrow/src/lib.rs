@@ -67,6 +67,7 @@ pub enum EscrowError {
     EscrowCompacted = 26,
     InvalidSplitConfig = 27,
     OutOfOrder = 28,
+    DuplicateIndex = 29,
 }
 
 #[contracttype]
@@ -847,6 +848,90 @@ impl Escrow {
         env.events()
             .publish((symbol_short!("release"), id), (index, m.amount));
         Ok(())
+    }
+
+    /// Client approves several milestones in one call: all indices are
+    /// validated first (all-or-nothing), the summed amount is paid out once and
+    /// the escrow is saved once. Returns the total paid.
+    pub fn release_milestones(env: Env, id: u64, indices: Vec<u32>) -> Result<i128, EscrowError> {
+        require_not_paused(&env)?;
+        let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
+        c.client.require_auth();
+        if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let count = indices.len();
+        if count == 0 || count > MAX_MILESTONES {
+            return Err(EscrowError::InvalidMilestones);
+        }
+
+        let mut total: i128 = 0;
+        for (pos, index) in indices.iter().enumerate() {
+            for earlier in indices.iter().take(pos) {
+                if earlier == index {
+                    return Err(EscrowError::DuplicateIndex);
+                }
+            }
+            let m = c
+                .milestones
+                .get(index)
+                .ok_or(EscrowError::MilestoneNotFound)?;
+            if m.released {
+                return Err(EscrowError::MilestoneAlreadyReleased);
+            }
+            total = total
+                .checked_add(m.amount)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
+        }
+
+        // Sequential escrows: every milestone before a requested index must be
+        // already released or part of this batch.
+        if is_sequential(&env, id) {
+            for index in indices.iter() {
+                for j in 0..index {
+                    let prior = c.milestones.get(j).ok_or(EscrowError::MilestoneNotFound)?;
+                    if !prior.released && !indices.contains(j) {
+                        return Err(EscrowError::OutOfOrder);
+                    }
+                }
+            }
+        }
+
+        let held = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        if held < total {
+            return Err(EscrowError::InsufficientFunds);
+        }
+
+        pay_out(&env, &c, total);
+        for index in indices.iter() {
+            let mut m = c.milestones.get(index).unwrap();
+            m.released = true;
+            c.milestones.set(index, m);
+        }
+        c.released_amount = c
+            .released_amount
+            .checked_add(total)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        if c.milestones.iter().all(|x| x.released) {
+            transition(&mut c, ContractStatus::Completed)?;
+            record_closed_at(&env, id);
+        }
+        sub_liability(&env, &c.token, total)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
+        save(&env, &c);
+        for index in indices.iter() {
+            let amount = c.milestones.get(index).unwrap().amount;
+            env.events()
+                .publish((symbol_short!("release"), id), (index, amount));
+        }
+        env.events()
+            .publish((symbol_short!("rel_batch"), id), (count, total));
+        Ok(total)
     }
 
     /// Client pays a bonus/tip directly to the freelancer.
