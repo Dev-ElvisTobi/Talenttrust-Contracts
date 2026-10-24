@@ -17,6 +17,8 @@ use soroban_sdk::{
 };
 
 pub const MAX_MILESTONES: u32 = 20;
+/// Maximum number of ids accepted by `get_escrow_summaries`.
+pub const MAX_SUMMARY_BATCH: u32 = 25;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 /// Minimum amount for a single milestone: 0.1 token unit at 7 decimal places.
 pub const MIN_MILESTONE_AMOUNT: i128 = 1_000_000;
@@ -98,6 +100,23 @@ pub struct EscrowContract {
     pub refunded_amount: i128,
     pub status: ContractStatus,
     pub reputation_issued: bool,
+}
+
+/// Read-only view of an escrow's status and derived balances.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowSummary {
+    pub id: u64,
+    pub status: ContractStatus,
+    pub total_amount: i128,
+    pub funded_amount: i128,
+    pub released_amount: i128,
+    pub held: i128,
+    pub remaining_to_fund: i128,
+    pub milestones_total: u32,
+    pub milestones_released: u32,
+    pub next_unreleased: Option<u32>,
+    pub next_release_affordable: bool,
 }
 
 /// Compact record kept for a terminal escrow after `compact_escrow`.
@@ -209,6 +228,36 @@ fn load(env: &Env, id: u64) -> Result<EscrowContract, EscrowError> {
         .persistent()
         .get(&DataKey::Contract(id))
         .ok_or(EscrowError::ContractNotFound)
+}
+
+fn summarize(c: &EscrowContract) -> EscrowSummary {
+    let mut milestones_released = 0u32;
+    let mut next_unreleased: Option<u32> = None;
+    for (i, m) in c.milestones.iter().enumerate() {
+        if m.released {
+            milestones_released += 1;
+        } else if next_unreleased.is_none() {
+            next_unreleased = Some(i as u32);
+        }
+    }
+    let held = c.funded_amount - c.released_amount;
+    let next_release_affordable = match next_unreleased {
+        Some(index) => c.milestones.get(index).map(|m| held >= m.amount).unwrap_or(false),
+        None => false,
+    };
+    EscrowSummary {
+        id: c.id,
+        status: c.status,
+        total_amount: c.total_amount,
+        funded_amount: c.funded_amount,
+        released_amount: c.released_amount,
+        held,
+        remaining_to_fund: c.total_amount - c.funded_amount,
+        milestones_total: c.milestones.len(),
+        milestones_released,
+        next_unreleased,
+        next_release_affordable,
+    }
 }
 
 fn save(env: &Env, c: &EscrowContract) {
@@ -1087,6 +1136,37 @@ impl Escrow {
             return Err(EscrowError::EscrowCompacted);
         }
         load(&env, id)
+    }
+
+    /// Returns a single milestone; `MilestoneNotFound` when out of range.
+    pub fn get_milestone(env: Env, id: u64, index: u32) -> Result<Milestone, EscrowError> {
+        load(&env, id)?
+            .milestones
+            .get(index)
+            .ok_or(EscrowError::MilestoneNotFound)
+    }
+
+    /// Returns the status and derived balances of one escrow. Read-only.
+    pub fn get_escrow_summary(env: Env, id: u64) -> Result<EscrowSummary, EscrowError> {
+        Ok(summarize(&load(&env, id)?))
+    }
+
+    /// Returns up to `MAX_SUMMARY_BATCH` summaries; unknown ids are skipped and
+    /// larger batches return `InvalidAmount`. Read-only.
+    pub fn get_escrow_summaries(
+        env: Env,
+        ids: Vec<u64>,
+    ) -> Result<Vec<EscrowSummary>, EscrowError> {
+        if ids.len() > MAX_SUMMARY_BATCH {
+            return Err(EscrowError::InvalidAmount);
+        }
+        let mut result = Vec::new(&env);
+        for id in ids.iter() {
+            if let Ok(c) = load(&env, id) {
+                result.push_back(summarize(&c));
+            }
+        }
+        Ok(result)
     }
 
     /// Compacts a terminal escrow into a small receipt to reduce storage rent.
