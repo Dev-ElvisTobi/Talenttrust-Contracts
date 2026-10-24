@@ -36,9 +36,11 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `cancel_contract(id)` | client | Refund unreleased funds and close (increments `cancellations` if funds held) |
 | `issue_reputation(id, rating)` | client | Rate a completed or resolved job (1-5), once |
 | `void_rating(id, reason)` | admin | Void a fraudulent rating, reverse reputation and emit audit trail |
+| `sweep_surplus(token, to) -> i128` | admin | Sweep untracked token surplus above aggregate escrow liabilities (`NoSurplus` (`21`) if none) |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
 | `get_contract(id)`, `get_rating(id)`, `contract_count()`, `get_reputation(addr)`, `get_outcomes(addr)`, `get_admin()`, `version()` | - | Reads |
 | `get_bonus(id)`, `get_bonus_total(freelancer)` | - | Reads for cumulative bonus amounts |
+| `get_liability(token)` | - | Aggregate amount held for live escrows in `token` |
 
 ### Status flow
 

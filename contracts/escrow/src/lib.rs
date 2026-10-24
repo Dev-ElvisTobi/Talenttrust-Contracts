@@ -49,6 +49,7 @@ pub enum EscrowError {
     RatingNotFound = 18,
     RatingAlreadyVoided = 19,
     InvalidTransition = 20,
+    NoSurplus = 21,
 }
 
 #[contracttype]
@@ -121,6 +122,7 @@ enum DataKey {
     Rating(u64),
     Bonus(u64),
     BonusTotal(Address),
+    Liability(Address),
 }
 
 #[contract]
@@ -176,6 +178,51 @@ fn transfer(env: &Env, token_addr: &Address, from: &Address, to: &Address, amoun
     if amount > 0 {
         token::Client::new(env, token_addr).transfer(from, to, &amount);
     }
+}
+
+// Liability helper functions: aggregate per-token amount the contract owes to live escrows.
+fn liability_of(env: &Env, token: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Liability(token.clone()))
+        .unwrap_or(0)
+}
+
+fn set_liability(env: &Env, token: &Address, value: i128) {
+    let key = DataKey::Liability(token.clone());
+    env.storage().persistent().set(&key, &value);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+}
+
+fn add_liability(env: &Env, token: &Address, amount: i128) -> Result<(), EscrowError> {
+    let updated = liability_of(env, token)
+        .checked_add(amount)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
+    set_liability(env, token, updated);
+    Ok(())
+}
+
+fn sub_liability(env: &Env, token: &Address, amount: i128) -> Result<(), EscrowError> {
+    let updated = liability_of(env, token)
+        .checked_sub(amount)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
+    set_liability(env, token, updated);
+    Ok(())
+}
+
+/// Solvency invariant (test + debug only): the contract's token balance covers all liabilities.
+#[cfg(any(test, debug_assertions))]
+fn assert_solvent(env: &Env, token: &Address) {
+    let balance = token::Client::new(env, token).balance(&env.current_contract_address());
+    let liability = liability_of(env, token);
+    assert!(
+        balance >= liability,
+        "Solvency invariant violated: balance {} < liability {}",
+        balance,
+        liability
+    );
 }
 
 pub fn transition(c: &mut EscrowContract, to: ContractStatus) -> Result<(), EscrowError> {
@@ -270,6 +317,28 @@ impl Escrow {
             .unwrap_or(false)
     }
 
+    /// Returns the active per-token liability counter.
+    pub fn get_liability(env: Env, token: Address) -> i128 {
+        liability_of(&env, &token)
+    }
+
+    /// Admin-only: sweeps untracked token surplus above aggregate liabilities.
+    pub fn sweep_surplus(env: Env, token: Address, to: Address) -> Result<i128, EscrowError> {
+        require_admin(&env)?;
+        let token_client = token::Client::new(&env, &token);
+        let this = env.current_contract_address();
+        let balance = token_client.balance(&this);
+        let liability = liability_of(&env, &token);
+        let surplus = balance.checked_sub(liability).unwrap_or(0);
+        if surplus <= 0 {
+            return Err(EscrowError::NoSurplus);
+        }
+        token_client.transfer(&this, &to, &surplus);
+        env.events()
+            .publish((symbol_short!("sweep"), token), (to, surplus));
+        Ok(surplus)
+    }
+
     /// Creates a new escrow agreement. Returns the escrow id.
     pub fn create_contract(
         env: Env,
@@ -350,6 +419,9 @@ impl Escrow {
         if c.funded_amount == c.total_amount {
             transition(&mut c, ContractStatus::Funded)?;
         }
+        add_liability(&env, &c.token, amount)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
         save(&env, &c);
         env.events().publish((symbol_short!("deposit"), id), amount);
         Ok(())
@@ -386,6 +458,9 @@ impl Escrow {
         if c.milestones.iter().all(|x| x.released) {
             transition(&mut c, ContractStatus::Completed)?;
         }
+        sub_liability(&env, &c.token, m.amount)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
         save(&env, &c);
         env.events()
             .publish((symbol_short!("release"), id), (index, m.amount));
@@ -521,6 +596,9 @@ impl Escrow {
         c.released_amount += to_freelancer;
         c.funded_amount = c.released_amount;
         transition(&mut c, ContractStatus::Resolved)?;
+        sub_liability(&env, &c.token, held)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
         save(&env, &c);
 
         // Record dispute outcomes for both parties
@@ -600,6 +678,9 @@ impl Escrow {
         );
         c.funded_amount = c.released_amount;
         transition(&mut c, ContractStatus::Cancelled)?;
+        sub_liability(&env, &c.token, refund)?;
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
         save(&env, &c);
 
         // Increment cancellations for client only when funds were held
