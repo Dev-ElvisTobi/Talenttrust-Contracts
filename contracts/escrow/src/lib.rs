@@ -50,6 +50,7 @@ pub enum EscrowError {
     RatingAlreadyVoided = 19,
     InvalidTransition = 20,
     NoSurplus = 21,
+    EscrowFrozen = 22,
 }
 
 #[contracttype]
@@ -124,6 +125,7 @@ enum DataKey {
     BonusTotal(Address),
     Liability(Address),
     Payout(u64),
+    Frozen(u64),
 }
 
 #[contract]
@@ -150,6 +152,20 @@ fn require_not_paused(env: &Env) -> Result<(), EscrowError> {
         .unwrap_or(false)
     {
         return Err(EscrowError::Paused);
+    }
+    Ok(())
+}
+
+fn escrow_frozen(env: &Env, id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Frozen(id))
+        .unwrap_or(false)
+}
+
+fn require_not_frozen(env: &Env, id: u64) -> Result<(), EscrowError> {
+    if escrow_frozen(env, id) {
+        return Err(EscrowError::EscrowFrozen);
     }
     Ok(())
 }
@@ -364,6 +380,7 @@ impl Escrow {
     pub fn set_payout_address(env: Env, id: u64, payout: Address) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
         c.freelancer.require_auth();
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
@@ -387,6 +404,49 @@ impl Escrow {
     pub fn get_payout_address(env: Env, id: u64) -> Result<Address, EscrowError> {
         let c = load(&env, id)?;
         Ok(payee(&env, &c))
+    }
+
+    /// Freezes a single escrow agreement (admin only). While frozen, every
+    /// party-initiated mutation on that escrow returns `EscrowFrozen`;
+    /// `resolve_dispute` remains available so the admin can settle it.
+    pub fn freeze_escrow(env: Env, id: u64, reason: Symbol) -> Result<(), EscrowError> {
+        require_admin(&env)?;
+        if !env.storage().persistent().has(&DataKey::Contract(id)) {
+            return Err(EscrowError::ContractNotFound);
+        }
+        if escrow_frozen(&env, id) {
+            return Err(EscrowError::EscrowFrozen);
+        }
+        let key = DataKey::Frozen(id);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events().publish((symbol_short!("frozen"), id), reason);
+        Ok(())
+    }
+
+    /// Unfreezes a frozen escrow agreement (admin only).
+    pub fn unfreeze_escrow(env: Env, id: u64) -> Result<(), EscrowError> {
+        require_admin(&env)?;
+        if !env.storage().persistent().has(&DataKey::Contract(id)) {
+            return Err(EscrowError::ContractNotFound);
+        }
+        if !escrow_frozen(&env, id) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let key = DataKey::Frozen(id);
+        env.storage().persistent().set(&key, &false);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events().publish((symbol_short!("unfrozen"), id), ());
+        Ok(())
+    }
+
+    /// Checks if a specific escrow is frozen.
+    pub fn is_frozen(env: Env, id: u64) -> bool {
+        escrow_frozen(&env, id)
     }
 
     /// Creates a new escrow agreement. Returns the escrow id.
@@ -444,6 +504,7 @@ impl Escrow {
     pub fn deposit_funds(env: Env, id: u64, amount: i128) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
         c.client.require_auth();
         if c.status != ContractStatus::Created {
             return Err(EscrowError::InvalidStatus);
@@ -481,6 +542,7 @@ impl Escrow {
     pub fn release_milestone(env: Env, id: u64, index: u32) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
@@ -525,6 +587,7 @@ impl Escrow {
     pub fn pay_bonus(env: Env, id: u64, amount: i128) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Funded | ContractStatus::Completed) {
             return Err(EscrowError::InvalidStatus);
@@ -587,6 +650,7 @@ impl Escrow {
     pub fn open_dispute(env: Env, id: u64, caller: Address) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
         caller.require_auth();
         if caller != c.client && caller != c.freelancer {
             return Err(EscrowError::Unauthorized);
@@ -628,6 +692,7 @@ impl Escrow {
     /// If freelancer_bps >= DISPUTE_WIN_THRESHOLD_BPS (5_000 bps, or 50%),
     /// freelancer gets a dispute win and client gets a dispute loss.
     /// Otherwise, freelancer gets a loss and client gets a win.
+    /// Note: this operation remains allowed even when the escrow is frozen.
     pub fn resolve_dispute(env: Env, id: u64, freelancer_bps: u32) -> Result<(), EscrowError> {
         require_admin(&env)?;
         let mut c = load(&env, id)?;
@@ -714,6 +779,7 @@ impl Escrow {
     pub fn cancel_contract(env: Env, id: u64) -> Result<(), EscrowError> {
         require_not_paused(&env)?;
         let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Created | ContractStatus::Funded) {
             return Err(EscrowError::InvalidStatus);
@@ -762,6 +828,7 @@ impl Escrow {
     /// After completion or dispute resolution the client may rate the freelancer (1..=5) once per contract.
     pub fn issue_reputation(env: Env, id: u64, rating: u32) -> Result<(), EscrowError> {
         let mut c = load(&env, id)?;
+        require_not_frozen(&env, id)?;
         c.client.require_auth();
         if !matches!(c.status, ContractStatus::Completed | ContractStatus::Resolved) {
             return Err(EscrowError::InvalidStatus);
