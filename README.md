@@ -27,7 +27,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | Function | Auth | Description |
 | --- | --- | --- |
 | `initialize(admin)` | admin | One-time setup |
-| `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones |
+| `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones. Rejects self-referential parties (client, freelancer or token equal to the contract address), the admin as client or freelancer, milestones below `MIN_MILESTONE_AMOUNT` (1 000 000), and totals above `MAX_ESCROW_TOTAL` (10¹⁸). Validation order: parties → milestones → amounts. |
 | `deposit_funds(id, amount)` | client | Transfer tokens into escrow (status must be `Created`, cannot exceed total) |
 | `release_milestone(id, index)` | client | Pay the freelancer (or their payout address) for a milestone |
 | `set_payout_address(id, payout)` | freelancer | Route payouts to a separate address; `Created`/`Funded` only, not during dispute |
@@ -74,6 +74,39 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 - Protocol admin can void fraudulent or collusive ratings via `void_rating(id, reason)`, which subtracts the rating and 1 contract from the freelancer's reputation and emits `("rep_void", id) -> (freelancer, rating, reason)`.
 - Voided escrows remain flagged so they cannot be re-rated (`ReputationAlreadyIssued`). Attempting to void twice returns `EscrowError::RatingAlreadyVoided (19)`.
 - Ratings issued before this audit trail upgrade have no `RatingRecord` and return `EscrowError::RatingNotFound (18)`.
+
+## Error catalog
+
+| Code | Variant | Raised by |
+| ---: | --- | --- |
+| 1 | `AlreadyInitialized` | `initialize` |
+| 2 | `NotInitialized` | any call before `initialize` |
+| 3 | `Unauthorized` | `open_dispute` when caller is neither party |
+| 4 | `Paused` | any mutating function while paused |
+| 5 | `ContractNotFound` | any function with an unknown escrow id |
+| 6 | `InvalidParties` | `create_contract` — client, freelancer or token equals the contract address, or client == freelancer; `set_payout_address` |
+| 7 | `InvalidMilestones` | `create_contract` — zero milestones or more than 20 |
+| 8 | `InvalidAmount` | non-positive amounts; `create_contract` total > `MAX_ESCROW_TOTAL` |
+| 9 | `OverFunded` | `deposit_funds` — would exceed the escrow total |
+| 10 | `InvalidStatus` | operation not allowed in the current status |
+| 11 | `MilestoneNotFound` | `release_milestone` |
+| 12 | `MilestoneAlreadyReleased` | `release_milestone` |
+| 13 | `InsufficientFunds` | `release_milestone` — not enough deposited yet |
+| 14 | `InvalidSplit` | `resolve_dispute` — basis points > 10 000 |
+| 15 | `InvalidRating` | `issue_reputation` — rating outside 1–5 |
+| 16 | `ReputationAlreadyIssued` | `issue_reputation` — already rated this contract |
+| 17 | `ArithmeticOverflow` | checked counter / ledger arithmetic |
+| 18 | `RatingNotFound` | `void_rating` |
+| 19 | `RatingAlreadyVoided` | `void_rating` |
+| 20 | `InvalidTransition` | guarded status machine |
+| 21 | `NoSurplus` | `sweep_surplus` |
+| 22 | `EscrowFrozen` | party mutations on a frozen escrow; `freeze_escrow` twice |
+| 23 | `AdminCannotBeParty` | `create_contract` — client or freelancer is the admin address |
+| 24 | `MilestoneTooSmall` | `create_contract` — milestone amount < `MIN_MILESTONE_AMOUNT` (1 000 000) |
+
+Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
+
+Error codes are **append-only** and never renumbered — the frontend and backend map directly on them.
 
 ## Build and test
 

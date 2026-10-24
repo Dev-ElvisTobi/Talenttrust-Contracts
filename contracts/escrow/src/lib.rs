@@ -18,6 +18,10 @@ use soroban_sdk::{
 
 pub const MAX_MILESTONES: u32 = 20;
 pub const BPS_DENOMINATOR: i128 = 10_000;
+/// Minimum amount for a single milestone: 0.1 token unit at 7 decimal places.
+pub const MIN_MILESTONE_AMOUNT: i128 = 1_000_000;
+/// Maximum total escrow value: 10^18 stroops.
+pub const MAX_ESCROW_TOTAL: i128 = 1_000_000_000_000_000_000; // 10^18
 /// Threshold for dispute outcome accounting (5,000 basis points, or 50%).
 /// In dispute resolution, if freelancer_bps >= DISPUTE_WIN_THRESHOLD_BPS,
 /// the outcome is counted as a win for the freelancer and a loss for the client; otherwise, the reverse.
@@ -51,6 +55,8 @@ pub enum EscrowError {
     InvalidTransition = 20,
     NoSurplus = 21,
     EscrowFrozen = 22,
+    AdminCannotBeParty = 23,
+    MilestoneTooSmall = 24,
 }
 
 #[contracttype]
@@ -457,27 +463,48 @@ impl Escrow {
         token: Address,
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, EscrowError> {
-        admin(&env)?;
+        let admin_addr = admin(&env)?;
         require_not_paused(&env)?;
         client.require_auth();
-        if client == freelancer {
+
+        // Validation order: parties -> milestones -> amounts.
+        // ---- Parties ----
+        let contract_addr = env.current_contract_address();
+        if client == contract_addr
+            || freelancer == contract_addr
+            || token == contract_addr
+            || client == freelancer
+        {
             return Err(EscrowError::InvalidParties);
         }
+        if client == admin_addr || freelancer == admin_addr {
+            return Err(EscrowError::AdminCannotBeParty);
+        }
+
+        // ---- Milestones ----
         let n = milestone_amounts.len();
         if n == 0 || n > MAX_MILESTONES {
             return Err(EscrowError::InvalidMilestones);
         }
+
+        // ---- Amounts ----
         let mut milestones = Vec::new(&env);
         let mut total: i128 = 0;
         for amount in milestone_amounts.iter() {
             if amount <= 0 {
                 return Err(EscrowError::InvalidAmount);
             }
+            if amount < MIN_MILESTONE_AMOUNT {
+                return Err(EscrowError::MilestoneTooSmall);
+            }
             total = total.checked_add(amount).ok_or(EscrowError::InvalidAmount)?;
             milestones.push_back(Milestone {
                 amount,
                 released: false,
             });
+        }
+        if total > MAX_ESCROW_TOTAL {
+            return Err(EscrowError::InvalidAmount);
         }
         let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
