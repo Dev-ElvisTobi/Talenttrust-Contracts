@@ -28,6 +28,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | --- | --- | --- |
 | `initialize(admin)` | admin | One-time setup |
 | `create_contract(client, freelancer, token, milestone_amounts) -> u64` | client | Create an escrow with up to 20 milestones. Rejects self-referential parties (client, freelancer or token equal to the contract address), the admin as client or freelancer, milestones below `MIN_MILESTONE_AMOUNT` (1 000 000), and totals above `MAX_ESCROW_TOTAL` (10¹⁸). Validation order: parties → milestones → amounts. |
+| `create_contract_sequential(client, freelancer, token, milestone_amounts) -> u64` | client | Same as `create_contract`, but milestones must be released strictly in order (`OutOfOrder` (`28`) otherwise); emits `("seq", id) -> true` |
 | `deposit_funds(id, amount)` | client | Transfer tokens into escrow (status must be `Created`, cannot exceed total) |
 | `set_team_split(id, payees)` | freelancer | Configure 1-5 fixed-bps payee shares (sum 10,000) while `Created` and before any deposit (`InvalidSplitConfig` (`27`) otherwise); emits `("team", id) -> len` |
 | `release_milestone(id, index)` | client | Pay the milestone to the team split if set, otherwise the freelancer (or their payout address) |
@@ -45,6 +46,7 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
 | `get_contract(id)`, `get_rating(id)`, `contract_count()`, `get_reputation(addr)`, `get_outcomes(addr)`, `get_admin()`, `version()` | - | Reads |
 | `get_bonus(id)`, `get_bonus_total(freelancer)` | - | Reads for cumulative bonus amounts |
+| `next_releasable(id) -> Option<u32>` | - | Lowest unreleased milestone index (`None` when all released) |
 | `get_milestone(id, index)` | - | Single milestone; `MilestoneNotFound` when out of range |
 | `get_escrow_summary(id)` | - | Status and derived balances (`held`, `remaining_to_fund`, milestone counts, next unreleased index, whether the held balance covers it) |
 | `get_escrow_summaries(ids)` | - | Up to 25 summaries; unknown ids skipped, larger batches return `InvalidAmount` |
@@ -115,6 +117,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 25 | `NotCompactable` | `compact_escrow` — escrow live, already compacted, or unrated within the grace period |
 | 26 | `EscrowCompacted` | `get_contract` / `issue_reputation` on a compacted escrow |
 | 27 | `InvalidSplitConfig` | `set_team_split` — bad length, zero/duplicate share, client/contract payee, or sum != 10 000 |
+| 28 | `OutOfOrder` | `release_milestone` on a sequential escrow before all earlier milestones are released |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

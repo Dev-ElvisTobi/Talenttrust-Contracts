@@ -66,6 +66,7 @@ pub enum EscrowError {
     NotCompactable = 25,
     EscrowCompacted = 26,
     InvalidSplitConfig = 27,
+    OutOfOrder = 28,
 }
 
 #[contracttype]
@@ -182,6 +183,7 @@ enum DataKey {
     Team(u64),
     ClientReputation(Address),
     ClientRated(u64),
+    Sequential(u64),
 }
 
 #[contract]
@@ -399,6 +401,93 @@ fn pay_out(env: &Env, c: &EscrowContract, amount: i128) {
     }
 }
 
+/// Shared builder for `create_contract` and `create_contract_sequential`.
+fn build_escrow(
+    env: Env,
+    client: Address,
+    freelancer: Address,
+    token: Address,
+    milestone_amounts: Vec<i128>,
+) -> Result<u64, EscrowError> {
+    let admin_addr = admin(&env)?;
+    require_not_paused(&env)?;
+    client.require_auth();
+
+    // Validation order: parties -> milestones -> amounts.
+    // ---- Parties ----
+    let contract_addr = env.current_contract_address();
+    if client == contract_addr
+        || freelancer == contract_addr
+        || token == contract_addr
+        || client == freelancer
+    {
+        return Err(EscrowError::InvalidParties);
+    }
+    if client == admin_addr || freelancer == admin_addr {
+        return Err(EscrowError::AdminCannotBeParty);
+    }
+
+    // ---- Milestones ----
+    let n = milestone_amounts.len();
+    if n == 0 || n > MAX_MILESTONES {
+        return Err(EscrowError::InvalidMilestones);
+    }
+
+    // ---- Amounts ----
+    let mut milestones = Vec::new(&env);
+    let mut total: i128 = 0;
+    for amount in milestone_amounts.iter() {
+        if amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
+        if amount < MIN_MILESTONE_AMOUNT {
+            return Err(EscrowError::MilestoneTooSmall);
+        }
+        total = total.checked_add(amount).ok_or(EscrowError::InvalidAmount)?;
+        milestones.push_back(Milestone {
+            amount,
+            released: false,
+        });
+    }
+    if total > MAX_ESCROW_TOTAL {
+        return Err(EscrowError::InvalidAmount);
+    }
+    let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
+    env.storage().instance().set(&DataKey::NextId, &(id + 1));
+    bump_instance(&env);
+    let c = EscrowContract {
+        id,
+        client: client.clone(),
+        freelancer: freelancer.clone(),
+        token,
+        milestones,
+        total_amount: total,
+        funded_amount: 0,
+        released_amount: 0,
+        refunded_amount: 0,
+        status: ContractStatus::Created,
+        reputation_issued: false,
+    };
+    save(&env, &c);
+    env.events()
+        .publish((symbol_short!("created"), id), (client, freelancer, total));
+    Ok(id)
+}
+
+fn is_sequential(env: &Env, id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Sequential(id))
+        .unwrap_or(false)
+}
+
+fn first_unreleased(c: &EscrowContract) -> Option<u32> {
+    c.milestones
+        .iter()
+        .position(|m| !m.released)
+        .map(|i| i as u32)
+}
+
 pub fn transition(c: &mut EscrowContract, to: ContractStatus) -> Result<(), EscrowError> {
     use ContractStatus::*;
     let allowed = match (c.status, to) {
@@ -601,69 +690,33 @@ impl Escrow {
         token: Address,
         milestone_amounts: Vec<i128>,
     ) -> Result<u64, EscrowError> {
-        let admin_addr = admin(&env)?;
-        require_not_paused(&env)?;
-        client.require_auth();
+        build_escrow(env, client, freelancer, token, milestone_amounts)
+    }
 
-        // Validation order: parties -> milestones -> amounts.
-        // ---- Parties ----
-        let contract_addr = env.current_contract_address();
-        if client == contract_addr
-            || freelancer == contract_addr
-            || token == contract_addr
-            || client == freelancer
-        {
-            return Err(EscrowError::InvalidParties);
-        }
-        if client == admin_addr || freelancer == admin_addr {
-            return Err(EscrowError::AdminCannotBeParty);
-        }
-
-        // ---- Milestones ----
-        let n = milestone_amounts.len();
-        if n == 0 || n > MAX_MILESTONES {
-            return Err(EscrowError::InvalidMilestones);
-        }
-
-        // ---- Amounts ----
-        let mut milestones = Vec::new(&env);
-        let mut total: i128 = 0;
-        for amount in milestone_amounts.iter() {
-            if amount <= 0 {
-                return Err(EscrowError::InvalidAmount);
-            }
-            if amount < MIN_MILESTONE_AMOUNT {
-                return Err(EscrowError::MilestoneTooSmall);
-            }
-            total = total.checked_add(amount).ok_or(EscrowError::InvalidAmount)?;
-            milestones.push_back(Milestone {
-                amount,
-                released: false,
-            });
-        }
-        if total > MAX_ESCROW_TOTAL {
-            return Err(EscrowError::InvalidAmount);
-        }
-        let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
-        bump_instance(&env);
-        let c = EscrowContract {
-            id,
-            client: client.clone(),
-            freelancer: freelancer.clone(),
-            token,
-            milestones,
-            total_amount: total,
-            funded_amount: 0,
-            released_amount: 0,
-            refunded_amount: 0,
-            status: ContractStatus::Created,
-            reputation_issued: false,
-        };
-        save(&env, &c);
-        env.events()
-            .publish((symbol_short!("created"), id), (client, freelancer, total));
+    /// Creates an escrow whose milestones must be released strictly in order
+    /// (same validation as `create_contract`). Emits `("seq", id) -> true`.
+    pub fn create_contract_sequential(
+        env: Env,
+        client: Address,
+        freelancer: Address,
+        token: Address,
+        milestone_amounts: Vec<i128>,
+    ) -> Result<u64, EscrowError> {
+        let id = build_escrow(env.clone(), client, freelancer, token, milestone_amounts)?;
+        let key = DataKey::Sequential(id);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+        env.events().publish((symbol_short!("seq"), id), true);
         Ok(id)
+    }
+
+    /// Lowest unreleased milestone index, or `None` once every milestone is
+    /// released (works for both sequential and non-sequential escrows).
+    pub fn next_releasable(env: Env, id: u64) -> Result<Option<u32>, EscrowError> {
+        let c = load(&env, id)?;
+        Ok(first_unreleased(&c))
     }
 
     /// Freelancer configures fixed basis-point shares for a team of up to five
@@ -772,6 +825,9 @@ impl Escrow {
             .ok_or(EscrowError::MilestoneNotFound)?;
         if m.released {
             return Err(EscrowError::MilestoneAlreadyReleased);
+        }
+        if is_sequential(&env, id) && first_unreleased(&c) != Some(index) {
+            return Err(EscrowError::OutOfOrder);
         }
         if c.funded_amount - c.released_amount < m.amount {
             return Err(EscrowError::InsufficientFunds);

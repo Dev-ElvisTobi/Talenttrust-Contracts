@@ -2576,3 +2576,129 @@ fn test_rate_client_pause_gate() {
     assert_eq!(rep.completed_contracts, 1);
     assert_eq!(rep.total_rating, 5);
 }
+
+// ---------------------------------------------------------------------------
+// Sequential milestone releases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sequential_milestones_enforced() {
+    let s = setup();
+    let id = s.escrow.create_contract_sequential(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U, 300 * U],
+    );
+    s.escrow.deposit_funds(&id, &(600 * U));
+
+    // Cannot release milestone 2 before milestone 1
+    assert_eq!(
+        s.escrow.try_release_milestone(&id, &2),
+        Err(Ok(EscrowError::OutOfOrder))
+    );
+
+    // Cannot release milestone 1 before milestone 0
+    assert_eq!(
+        s.escrow.try_release_milestone(&id, &1),
+        Err(Ok(EscrowError::OutOfOrder))
+    );
+
+    // 0 then 1 succeeds
+    s.escrow.release_milestone(&id, &0);
+    s.escrow.release_milestone(&id, &1);
+
+    // Cannot release milestone 0 again
+    assert_eq!(
+        s.escrow.try_release_milestone(&id, &0),
+        Err(Ok(EscrowError::MilestoneAlreadyReleased))
+    );
+
+    s.escrow.release_milestone(&id, &2);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+    assert_eq!(s.token.balance(&s.freelancer), 600 * U);
+}
+
+#[test]
+fn non_sequential_milestones_allows_any_order() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U, 300 * U],
+    );
+    s.escrow.deposit_funds(&id, &(600 * U));
+
+    s.escrow.release_milestone(&id, &2);
+    s.escrow.release_milestone(&id, &0);
+    s.escrow.release_milestone(&id, &1);
+
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Completed);
+}
+
+#[test]
+fn next_releasable_tracks_lowest_unreleased() {
+    let s = setup();
+    let id = s.escrow.create_contract_sequential(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id, &(300 * U));
+    assert_eq!(s.escrow.next_releasable(&id), Some(0));
+    s.escrow.release_milestone(&id, &0);
+    assert_eq!(s.escrow.next_releasable(&id), Some(1));
+    s.escrow.release_milestone(&id, &1);
+    assert_eq!(s.escrow.next_releasable(&id), None);
+
+    // Works for non-sequential escrows too
+    let id2 = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&id2, &(300 * U));
+    s.escrow.release_milestone(&id2, &1);
+    assert_eq!(s.escrow.next_releasable(&id2), Some(0));
+}
+
+#[test]
+fn sequential_create_emits_seq_event_and_validates_like_create() {
+    let s = setup();
+    let id = s.escrow.create_contract_sequential(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    let events = s.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(last.0, s.escrow.address);
+    assert_eq!(
+        Symbol::try_from_val(&s.env, &last.1.get(0).unwrap()).unwrap(),
+        symbol_short!("seq")
+    );
+    assert_eq!(u64::try_from_val(&s.env, &last.1.get(1).unwrap()).unwrap(), id);
+
+    assert_eq!(
+        s.escrow.try_create_contract_sequential(
+            &s.client,
+            &s.client,
+            &s.token.address,
+            &vec![&s.env, 100 * U],
+        ),
+        Err(Ok(EscrowError::InvalidParties))
+    );
+    assert_eq!(
+        s.escrow.try_create_contract_sequential(
+            &s.client,
+            &s.freelancer,
+            &s.token.address,
+            &vec![&s.env, 1i128],
+        ),
+        Err(Ok(EscrowError::MilestoneTooSmall))
+    );
+}
